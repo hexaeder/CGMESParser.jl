@@ -1,7 +1,7 @@
 name = "CGMESParser"
 uuid = "aad1fd81-18a3-467b-9d7b-77610df96f30"
 authors = ["Hans Würfel <git@wuerfel.io> and contributors"]
-version = "0.1.0-DEV"
+version = "0.1.0"
 
 [workspace]
 projects = ["test", "docs"]
