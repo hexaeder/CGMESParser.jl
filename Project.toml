@@ -1,0 +1,25 @@
+name = "CGMESParser"
+uuid = "aad1fd81-18a3-467b-9d7b-77610df96f30"
+authors = ["Hans Würfel <git@wuerfel.io> and contributors"]
+version = "0.1.0-DEV"
+
+[workspace]
+projects = ["test", "docs"]
+
+[deps]
+Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"
+OrderedCollections = "bac558e1-5e72-5ebc-8fee-abe8a469f55d"
+XML = "72c71f33-b9b6-44de-8c94-c961784809e2"
+
+[weakdeps]
+GraphMakie = "1ecd5474-83a3-4783-bb4f-06765db800d2"
+
+[extensions]
+CGMESParserGraphMakieExt = "GraphMakie"
+
+[compat]
+GraphMakie = "0.6"
+Graphs = "1.14"
+OrderedCollections = "1.8.1, 2"
+XML = "0.3.9"
+julia = "1.10"

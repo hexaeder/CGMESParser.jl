@@ -1,0 +1,363 @@
+# strip thos prefixs from names
+KNOWN_PREFIXES = ["cim", "entsoe", "eu"]
+KNOWN_PROFILES = [
+    :EquipmentCore,
+    :CoreEquipment,
+    :EquipmentShortCircuit,
+    :EquipmentOperation,
+    :ShortCircuit,
+    :Topology,
+    :StateVariables,
+    :DiagramLayout,
+    :SteadyStateHypothesis,
+    :GeographicalLocation,
+    :Dynamics,
+]
+
+"""
+Extract the "Rescource Description Framework" (RDF) node from the XML document.
+"""
+function rdf_node(headnode)
+    childs = children(headnode)
+    # filter out declaration
+    filter!(n -> !(nodetype(n) == XML.Declaration), childs)
+    # filter out comments
+    filter!(n -> !(nodetype(n) == XML.Comment), childs)
+    # only one rdf node should remain
+    only(childs)
+end
+
+plain_name(el::Node, prefix::String; kw...) = plain_name(el, [prefix]; kw...)
+function plain_name(el::Node, prefixes; strip_ns=[])
+    noprefix = nothing
+    for prefix in prefixes
+        regex = Regex("^"*prefix*":(.*)\$")
+        m = match(regex, tag(el))
+        if !isnothing(m)
+            noprefix = m[1]
+            break
+        end
+    end
+    if isnothing(noprefix)
+        error("Element $(tag(el)) does not match any of the expected prefixes $prefixes.")
+    end
+    for ns in strip_ns
+        noprefix = replace(noprefix, ns*"." => "")
+    end
+    noprefix
+end
+
+function is_reference(el::Node)
+    haskey(attributes(el), "rdf:resource")
+end
+
+function is_object(el::Node)
+    nodetype(el) == XML.Element && contains(tag(el), r"^cim:") && haskey(attributes(el), "rdf:ID")
+end
+
+function is_extension(el::Node)
+    nodetype(el) == XML.Element && contains(tag(el), r"^cim:") && haskey(attributes(el), "rdf:about")
+end
+
+function is_metadata(el::Node)
+    nodetype(el) == XML.Element && tag(el) == "md:FullModel"
+end
+
+CIMRef(el::Node) = CIMRef(attributes(el)["rdf:resource"])
+
+function parse_metadata(md_node::Node)
+    attrs = attributes(md_node)
+    uuid = get(attrs, "rdf:about", "")
+    uuid = replace(uuid, "urn:uuid:" => "")
+
+    _profiles = String[]
+    dependencies = CIMRef[]
+    created = ""
+    scenario_time = ""
+    modeling_authority = ""
+
+    for child in children(md_node)
+        tag_name = tag(child)
+        if tag_name == "md:Model.profile"
+            if XML.is_simple(child)
+                val = XML.simple_value(child)
+                if !isnothing(val)
+                    push!(_profiles, val)
+                end
+            end
+        elseif tag_name == "md:Model.DependentOn"
+            dep_uuid = replace(attributes(child)["rdf:resource"], "urn:uuid:" => "")
+            push!(dependencies, CIMRef(dep_uuid))
+        elseif tag_name == "md:Model.created"
+            if XML.is_simple(child)
+                val = XML.simple_value(child)
+                if !isnothing(val)
+                    created = val
+                end
+            end
+        elseif tag_name == "md:Model.scenarioTime"
+            if XML.is_simple(child)
+                val = XML.simple_value(child)
+                if !isnothing(val)
+                    scenario_time = val
+                end
+            end
+        elseif tag_name == "md:Model.modelingAuthoritySet"
+            if XML.is_simple(child)
+                val = XML.simple_value(child)
+                if !isnothing(val)
+                    modeling_authority = val
+                end
+            end
+        end
+    end
+
+    profile = _determine_profile(_profiles)
+    return (uuid=uuid, profile=profile, dependencies=dependencies,
+            created=created, scenario_time=scenario_time, modeling_authority=modeling_authority)
+end
+
+"""
+    _extract_profile_name(profile_url::String)::String
+
+Extract the profile name from a CGMES profile URL.
+Supports multiple URL formats: ENTSO-E, IEC, and UCAIUG.
+"""
+function _extract_profile_name(profile_url::String)::String
+    # Try ENTSO-E format: http://entsoe.eu/CIM/{ProfileName}/X/Y
+    m = match(r"http://entsoe\.eu/CIM/([A-Za-z]+)/\d+/\d+", profile_url)
+    if !isnothing(m)
+        return m[1]
+    end
+
+    # Try IEC format: http://iec.ch/TC57/ns/CIM/{ProfileName}-EU/X.Y
+    m = match(r"http://iec\.ch/TC57/ns/CIM/([A-Za-z]+)(?:-EU)?/\d+\.\d+", profile_url)
+    if !isnothing(m)
+        return m[1]
+    end
+
+    # Try UCAIUG format: http://cim-profile.ucaiug.io/grid/{ProfileName}/X.Y
+    m = match(r"http://cim-profile\.ucaiug\.io/grid/([A-Za-z]+)/\d+\.\d+", profile_url)
+    if !isnothing(m)
+        return m[1]
+    end
+
+    error("Unknown profile URL format: $profile_url")
+end
+
+function _determine_profile(profiles)
+    # Extract profile names from URLs
+    profile_names = map(_extract_profile_name, profiles)
+
+    # Convert to symbols and match against KNOWN_PROFILES
+    candidates = map(profile_names) do name
+        sym = Symbol(name)
+        if sym in KNOWN_PROFILES
+            return sym
+        else
+            error("Unknown profile: $name (from URL). Expected one of: $KNOWN_PROFILES")
+        end
+    end
+
+    # If multiple profiles are present (e.g., EquipmentCore + EquipmentShortCircuit),
+    # return the first one that appears in KNOWN_PROFILES order (primary profile)
+    if !allequal(candidates)
+        # Find the first profile in KNOWN_PROFILES that appears in candidates
+        for known_profile in KNOWN_PROFILES
+            if known_profile in candidates
+                return known_profile
+            end
+        end
+    end
+
+    first(candidates)
+end
+
+# parser function
+function CIMObject(el::Node, profile)
+    name = plain_name(el, KNOWN_PREFIXES)
+    id = get(attributes(el), "rdf:ID", "")
+    props = _parseprops(el, name)
+    CIMObject(profile, id, name, props)
+end
+
+function CIMExtension(el::Node, profile)
+    name = plain_name(el, KNOWN_PREFIXES)
+    about = get(attributes(el), "rdf:about", "")
+    base = CIMRef(about)
+    props = _parseprops(el, name)
+    CIMExtension(profile, base, name, props)
+end
+
+function _parseprops(el::Node, name::AbstractString)
+    props = OrderedDict{String, Any}()
+    for p in children(el)
+        key = plain_name(p, KNOWN_PREFIXES; strip_ns=[name, "IdentifiedObject"])
+        if is_simple(p)
+            stringvalue = simple_value(p)
+            value = if !isnothing(tryparse(Int, stringvalue))
+                tryparse(Int, stringvalue)
+            elseif !isnothing(tryparse(Float64, stringvalue))
+                tryparse(Float64, stringvalue)
+            elseif !isnothing(tryparse(Bool, stringvalue))
+                tryparse(Bool, stringvalue)
+            else
+                stringvalue
+            end
+            _add_property!(props, key, value)
+        elseif is_reference(p)
+            _add_property!(props, key, CIMRef(p))
+        else
+            @warn "Skipping property $p, no parser defined yet."
+        end
+    end
+    props
+end
+function _add_property!(props, key, value)
+    if haskey(props, key)
+        newvec = vcat(props[key], value)
+        if !(newvec isa Vector{CIMRef})
+            @warn "Multiple values for property $key which are *not* CIMRef, this is not handled yet."
+        end
+        props[key] = newvec
+    else
+        props[key] = value
+    end
+end
+
+"""
+    CIMFile(filepath::String)
+
+Read a single CGMES profile file. References to objects in other profiles stay unresolved
+until the file is part of a [`CIMDataset`](@ref).
+"""
+function CIMFile(filepath::String)
+    filename = basename(filepath)
+    doc = XML.read(filepath, Node)
+    rdf = rdf_node(doc)
+
+    childs = copy(children(rdf))
+    midx = findall(is_metadata, childs)
+    if isnothing(midx)
+        error("No md:FullModel metadata found in file: $filepath")
+    elseif length(midx) > 1
+        error("Found more than one md:FullModel metadata in file: $filepath")
+    end
+    metadata = parse_metadata(childs[only(midx)])
+    deleteat!(childs, midx)
+
+    objects = OrderedDict{String, CIMObject}()
+    extensions = Vector{CIMExtension}()
+
+    for el in childs
+        if is_object(el)
+            obj = CIMObject(el, metadata.profile)
+            objects[obj.id] = obj
+        elseif is_extension(el)
+            ext = CIMExtension(el, metadata.profile)
+            push!(extensions, ext)
+        else
+            @warn "Skipping $(tag(el)), no parser for this element type."
+        end
+    end
+
+    # Create CIMCollection and then CIMFile with metadata
+    collection = CIMCollection(objects, extensions)
+    cim_file = CIMFile(
+        collection,
+        metadata.profile,
+        metadata.uuid,
+        metadata.created,
+        metadata.scenario_time,
+        metadata.dependencies,
+        metadata.modeling_authority,
+        filename
+    )
+
+    return cim_file
+end
+
+"""
+    CIMDataset(directory::String)
+
+Read a whole CGMES dataset: every XML file in `directory` becomes a [`CIMFile`](@ref), and
+the references between all of them are resolved.
+
+This is a faithful image of what the files say. Nothing is cleaned up and nothing is
+interpreted — see the transformations and [`split_topologically`](@ref) for that.
+"""
+function CIMDataset(directory::String)
+    files = OrderedDict{Symbol, CIMFile}()
+
+    # Check if directory exists
+    if !isdir(directory)
+        error("Directory not found: $directory")
+    end
+
+    # Find all XML files in directory
+    xml_files = filter(f -> endswith(lowercase(f), ".xml"), readdir(directory))
+
+    if isempty(xml_files)
+        @warn "No XML files found in directory: $directory"
+    end
+
+    # Parse each XML file
+    for filename in xml_files
+        filepath = joinpath(directory, filename)
+        try
+            cim_file = CIMFile(filepath)
+            profile = cim_file.profile
+
+            # Check for profile conflicts
+            if haskey(files, profile)
+                @warn "Multiple files found for profile $profile. Overwriting $(files[profile].filename) with $filename"
+            end
+
+            files[profile] = cim_file
+        catch e
+            @warn "Failed to parse file $filename: $e"
+            rethrow(e)
+        end
+    end
+
+    # reorder files acorrind got KNOWN_PROFILES
+    files_ordered = OrderedDict{Symbol, CIMFile}()
+    for profile in KNOWN_PROFILES
+        if haskey(files, profile)
+            files_ordered[profile] = files[profile]
+        end
+    end
+
+    # handle duplicate ids
+    allkeys = Set{String}()
+    duplicate_counts = Dict{Tuple{String,Symbol}, Int}()
+    for (profile, file) in files_ordered
+        filekeys = keys(objects(file))
+        duplicatekeys = intersect(allkeys, filekeys)
+
+        if !isempty(duplicatekeys)
+            for key in duplicatekeys
+                obj = objects(file)[key]
+                k = (obj.class_name, profile)
+                duplicate_counts[k] = get(duplicate_counts, k, 0) + 1
+
+                # move to extension
+                base = CIMRef(obj.id)
+                ext = CIMExtension(file.profile, base, obj.class_name, obj.properties)
+                push!(file.collection.extensions, ext)
+                # remove from objects
+                delete!(objects(file), key)
+            end
+        end
+
+        union!(allkeys, keys(objects(file)))
+    end
+    if !isempty(duplicate_counts)
+        lines = ["  $(count)x \"$(cls)\" from $profile" for ((cls, profile), count) in sort(collect(duplicate_counts))]
+        printstyled("Duplicate keys found — transformed into extensions:\n" * join(lines, "\n") * "\n"; color=:yellow)
+    end
+
+    dataset = CIMDataset(files_ordered, directory)
+    resolve_references!(dataset)
+    return dataset
+end

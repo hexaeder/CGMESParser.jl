@@ -1,0 +1,18 @@
+name = "CGMESParser-Tests"
+
+[deps]
+CGMESParser = "aad1fd81-18a3-467b-9d7b-77610df96f30"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+GraphMakie = "1ecd5474-83a3-4783-bb4f-06765db800d2"
+Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+CGMESParser = {path = ".."}
+
+[compat]
+CGMESParser = "≥0.0.1"
+CairoMakie = "0.15"
+GraphMakie = "≥0.0.1"
+Graphs = "≥0.0.1"
+Test = "1"

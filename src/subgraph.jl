@@ -1,0 +1,483 @@
+export is_terminal, is_class, is_lineend_terminal, discover_subgraph, is_injector, is_busbar_section_terminal, reduce_complexity
+export delete_unconnected, split_topologically
+
+"""
+    is_terminal(t)
+
+Whether `t` is a Terminal object.
+"""
+is_terminal(t) = is_class(t, "Terminal")
+
+INJECTOR_CLASSES = [
+    "SynchronousMachine",
+    "ConformLoad",
+    "PowerElectronicsConnection",
+    "LinearShuntCompensator",
+    "ExternalNetworkInjection",
+]
+function is_injector_terminal(t)
+    @assert is_terminal(t)
+    eq = t["ConductingEquipment"]
+    any(class -> is_class(eq, class), INJECTOR_CLASSES) || return false
+end
+
+BRANCH_CLASSES = [
+    "ACLineSegment",
+    "PowerTransformer",
+    "Switch",
+    "Breaker"
+]
+function is_lineend_terminal(t)
+    @assert is_terminal(t) "Expected Terminal, got $(t.class_name)"
+    eq = t["ConductingEquipment"]
+    any(class -> is_class(eq, class), BRANCH_CLASSES)
+end
+
+IGNORE_CLASSES = [
+    "BusbarSection",
+]
+
+# Equipment classes that are silently ignored during topological splitting
+# because no dynamic model exists for them yet.
+WARN_IGNORE_CLASSES = [
+    "ExternalNetworkInjection",
+]
+
+function is_ignored_terminal(t)
+    @assert is_terminal(t) "Expected Terminal, got $(t.class_name)"
+    eq = t["ConductingEquipment"]
+    if any(class -> is_class(eq, class), IGNORE_CLASSES)
+        if !isempty(ascendants(t, byclass("SvPowerFlow"))) && !iszero(get_injected_power_pu(t))
+            error("Ignored terminal $(t.id) has non-zero powerflow!")
+        end
+        return true
+    elseif any(class -> is_class(eq, class), WARN_IGNORE_CLASSES)
+        printstyled("Ignoring terminal $(t.id) (name=$(get(t.properties, "name", "?"))) connected to $(eq.class_name) '$(get(eq.properties, "name", "?"))' — no dynamic model implemented for this equipment class yet.\n"; color=:yellow)
+        if !isempty(ascendants(t, byclass("SvPowerFlow"))) && !iszero(get_injected_power_pu(t))
+            error("Ignored terminal $(t.id) has non-zero powerflow!")
+        end
+        return true
+    else
+        return false
+    end
+end
+
+"""
+    follow_branch(t::CIMObject(Terminal))::CIMObject(Terminal)
+
+Follow a branch from a terminal `t` to the other terminal at the opposite end of the branch.
+"""
+function follow_branch(t)
+    @assert is_lineend_terminal(t) "Expected terminal to be `is_lineend_terminal`"
+    eq = descend(t, byprop("ConductingEquipment"))
+    terms = ascendants(eq, byclass("Terminal", via="ConductingEquipment"))
+    @assert length(terms) == 2 "Expected exactly 2 terminals for branch equipment, found $(length(terms))"
+    if terms[1].id == t.id
+        return terms[2]
+    elseif terms[2].id == t.id
+        return terms[1]
+    else
+        error("Terminal $(t.id) not found among terminals of its conducting equipment $(eq.id)")
+    end
+end
+
+function topological_neighbors(tpn)
+    @assert is_class(tpn, "TopologicalNode") "Expected TopologicalNode, got $(tpn.class_name)"
+    terms = ascendants(tpn, byclass("Terminal", via="TopologicalNode"))
+    linends = filter(is_lineend_terminal, terms)
+    neighbors = CIMObject[]
+    for lineend in linends
+        other_term = follow_branch(lineend)
+        other_tpn = descend(other_term, byprop("TopologicalNode"))
+        if other_tpn.id != tpn.id
+            push!(neighbors, other_tpn)
+        end
+    end
+    neighbors
+end
+
+function is_busbar_section_terminal(t)
+    is_terminal(t) || return false
+    is_class(t["ConductingEquipment"], "BusbarSection")
+end
+
+STOP_FORWARD = [
+    "TopologicalIsland",
+]
+
+STOP_BACKREF = [
+    "BaseVoltage",
+    "VoltageLevel",
+    "OperationalLimitType",
+    "Substation",
+    "LoadAggregate",
+    "ConformLoadGroup",
+    "LoadResponseCharacteristic",
+    "TopologicalIsland",
+]
+
+"""
+    discover_subgraph(root; kwargs)::CIMCollection
+
+keyword arguments
+- `nobackref = is_class(STOP_BACKREF)`: don't follow back references on those nodes
+   unless the backref is from a :StateVariables profile
+- `maxdepth = 100`: maximum depth to explore
+- `filter_out = x -> false`: filter out nodes that match this predicate
+"""
+function discover_subgraph(
+    root::CIMObject;
+    nobackref = is_class(STOP_BACKREF),
+    noforward = is_class(STOP_FORWARD),
+    maxdepth = 100,
+    filter_out = x -> false,
+    warn=true
+)
+    objects = OrderedDict{String, CIMObject}()
+    extensions = Vector{CIMExtension}()
+
+    function recursive_discover!(node::CIMObject, depth::Int)
+        # Check if already processed (cycle detection)
+        haskey(objects, node.id) && return
+
+        # Check if this node should be filtered out
+        filter_out(node) && return
+
+        # Copy and add current node
+        objects[node.id] = copy(node)
+
+        # Copy and add extensions for this node
+        for ext_backref in node.extension
+            @assert ext_backref.source isa CIMExtension
+            push!(extensions, copy(ext_backref.source))
+        end
+
+        # Check if we've reached maximum depth
+        if depth >= maxdepth
+            @warn "Maximum recursion depth ($maxdepth) reached for node $(node.class_name) ($(node.id)). Stopping further exploration."
+            return
+        end
+
+        # Explore forward references (properties)
+        if !noforward(node)
+            for (key, refs) in properties(node)
+                refs isa Union{CIMRef,Vector{CIMRef}} || continue
+                for ref in refs
+                    is_external_ref(ref) && continue  # Skip external references
+                    is_unresolvable_ref(ref) && continue  # Skip unresolvable references
+                    @assert is_resolved(ref) "CIMRef $key => $ref in $node should be resolved before discovery."
+                    recursive_discover!(follow_ref(ref), depth + 1)
+                end
+            end
+        end
+
+        # Explore backward references - stop for nobackref nodes
+        # unless it is a state variable profile! that we allways follow
+
+        for backref in node.backrefs
+            source = base_object(backref)
+            if !nobackref(node) || source.profile == :StateVariables
+                recursive_discover!(source, depth + 1)
+            end
+        end
+    end
+
+    recursive_discover!(root, 1)
+
+    collection = CIMCollection(objects, extensions)
+    resolve_references!(collection; warn)
+end
+
+function Base.filter(f, collection::AbstractCIMCollection; warn=false)
+    _objects = OrderedDict{String, CIMObject}()
+    _extensions = Vector{CIMExtension}()
+
+    for (id, obj) in objects(collection)
+        if f(obj)
+            _objects[id] = copy(obj)
+            for ext_backref in obj.extension
+                @assert ext_backref.source isa CIMExtension
+                push!(_extensions, copy(ext_backref.source))
+            end
+        end
+    end
+    collection = CIMCollection(_objects, _extensions)
+    resolve_references!(collection; warn)
+end
+
+"""
+    split_topologically(collection; verbose=false, warn=false) -> (buses, branches)
+
+Split a dataset into the electrical graph it describes: one subgraph per bus and one per
+branch between two buses. Both are returned as `CIMCollection`s holding the objects that
+belong to them, so anything you can do to a dataset you can also do to a single bus.
+
+Switching detail is collapsed on the way — closed breakers merge the nodes they join,
+chains of branch elements become a single branch. Each branch subgraph records the names of
+the buses it connects in its metadata under `:src_name` and `:dst_name`, and each bus
+records its index under `:busidx`; a branch built from several elements keeps them under
+`:branches`.
+
+Errors on equipment classes it cannot classify, which is usually how you find out a dataset
+contains something not yet supported.
+"""
+function split_topologically(collection::AbstractCIMCollection; verbose=false, warn=false)
+    # sanity checks in presence of connectivity node, ther can be multiple connectivy nodes per topo node
+    for cn in collection("ConnectivityNode")
+        tn = descend(cn, byprop("TopologicalNode"))
+        cn_terms = Set(ascendants(cn, byclass("Terminal")))
+        tn_terms = Set(ascendants(tn, byclass("Terminal")))
+        if !(cn_terms ⊆ tn_terms)
+            @warn "ConnectivityNode $(getname(cn)) has terminals not belonging to its TopologicalNode $(getname(tn)). This may lead to unexpected results in topological splitting."
+        end
+    end
+
+    # collection = CIMDataset(DATA)
+    topnodes = collection("TopologicalNode")
+    verbose && @info "Found $(length(topnodes)) topological nodes. Discovering subgraphs..."
+    node_subgraphs = _discover_tpn_subgraph.(topnodes; warn)
+    # sanity checks
+    for subgraph in node_subgraphs
+        @assert length(subgraph("TopologicalNode")) == 1
+        @assert all(subgraph("Terminal")) do t
+            t["TopologicalNode"] == only(subgraph("TopologicalNode"))
+        end
+    end
+    if !allunique(sg.metadata[:busname] for sg in node_subgraphs)
+        names = [sg.metadata[:busname] for sg in node_subgraphs]
+        unique_names = unique(names)
+        for name in unique_names
+            appearances = findall(n -> n == name, names)
+            if !isnothing(appearances) && length(appearances) > 1
+                printstyled("WARNING: Bus name '$name' appears in multiple topological nodes at indices: $(appearances)\n", color=:yellow)
+                for idx in appearances
+                    sg = node_subgraphs[idx]
+                    id = only(sg("TopologicalNode")).id
+                    sg.metadata[:busname] *= id
+                    # println("  -> Appending id to bus name for uniqueness: new bus name '$(sg.metadata[:busname])'")
+                end
+            end
+        end
+    end
+    # sort
+    sort!(node_subgraphs, by = sg->sg.metadata[:busname])
+    # attach metadata
+    for (i, ng) in enumerate(node_subgraphs)
+        ng.metadata[:busidx] = i
+    end
+
+    undiscovered_lineends = filter(is_lineend_terminal, collection("Terminal"))
+    verbose && @info "Found $(length(undiscovered_lineends)) line ends. Discovering line end subgraphs..."
+    branch_subgraphs = CIMCollection[]
+    while !isempty(undiscovered_lineends)
+        lineend = popfirst!(undiscovered_lineends)
+
+        # check for loopback
+        this_tpn = descend(lineend, byprop("TopologicalNode"))
+        other_tpn = descend(follow_branch(lineend), byprop("TopologicalNode"))
+        if this_tpn.id == other_tpn.id
+            error("Found loopback branch at TopologicalNode '$(getname(this_tpn))' ($(this_tpn.id)). Skipping lineend '$(getname(lineend))' ($(lineend.id)). Consider using `filter_loopback_breakers`!")
+        end
+
+        subgraph = _discover_linened_subgraph(lineend; warn)
+        push!(branch_subgraphs, subgraph)
+
+        discovered_ids = [n.id for n in filter(is_lineend_terminal, subgraph("Terminal"))]
+
+        foundidx = findall(n -> n.id ∈ discovered_ids, undiscovered_lineends)
+        !isnothing(foundidx) && deleteat!(undiscovered_lineends, foundidx)
+    end
+    # sanity checks
+    for (i, subgraph) in enumerate(branch_subgraphs)
+        @assert length(subgraph("TopologicalNode")) == 2
+        @assert length(subgraph("Terminal")) == 2
+        # test that all terminals belong to the topological nodes
+        @assert all(subgraph("Terminal")) do t
+            getname(t["TopologicalNode"]) ∈ getname.(subgraph("TopologicalNode"))
+        end
+    end
+    # check, that all linenends are covered
+    all_linend_ids = mapreduce(branch -> map(t -> t.id, filter(is_lineend_terminal, branch("Terminal"))), vcat, branch_subgraphs)
+    linend_ids_in_collection = map(t -> t.id, filter(is_lineend_terminal, collection("Terminal")))
+    @assert sort(all_linend_ids) == sort(linend_ids_in_collection) "Not all lineends covered in subgraphs discovery!"
+
+    # attach metadata
+    for branch in branch_subgraphs
+        tns = branch("TopologicalNode")
+        src_name, dst_name = sort!([getname(tn) for tn in tns])
+        src_idx = findfirst(sg -> sg.metadata[:busname] == src_name, node_subgraphs)
+        dst_idx = findfirst(sg -> sg.metadata[:busname] == dst_name, node_subgraphs)
+        branch.metadata[:src_name] = src_name
+        branch.metadata[:dst_name] = dst_name
+        branch.metadata[:src_idx] = src_idx
+        branch.metadata[:dst_idx] = dst_idx
+    end
+
+    # merge lineend subgraphs that connect the same topological nodes
+    edge_dict = Dict{Pair{String,String}, CIMCollection}()
+    for branch in branch_subgraphs
+        tpns = branch("TopologicalNode")
+        @assert length(tpns) == 2
+        srcdst = [tp.id for tp in tpns]
+        src, dst = sort(srcdst)
+        if haskey(edge_dict, src => dst)
+            merged = merge_collection(edge_dict[src => dst], branch; warn, metadatakey=:branches)
+            edge_dict[src => dst] = merged
+        else
+            edge_dict[src => dst] = branch
+        end
+    end
+    edge_subgraphs = collect(values(edge_dict))
+
+    sort!(edge_subgraphs; by=eg->(eg.metadata[:src_idx], eg.metadata[:dst_idx]))
+
+    (; node_subgraphs, edge_subgraphs)
+end
+function _discover_tpn_subgraph(t; warn)
+    @assert is_class(t, "TopologicalNode") "Expected TopologicalNode, got $(t.class_name)"
+
+    S_sum = zero(ComplexF64)
+    S_branch = zero(ComplexF64)
+    terminals = ascendants(t, byclass("Terminal"))
+    term = terminals[1]
+    for term in terminals
+        _lineend = is_lineend_terminal(term)
+        _injector = is_injector_terminal(term)
+        _lineend && _injector && error("Terminal $term is classified as both lineend and injector terminal!")
+        if !(_lineend || _injector)
+            is_ignored_terminal(term) && continue
+            error("Terminal $term is neither lineend nor injector terminal!")
+        end
+        S_sum += get_injected_power_pu(term)
+        if _lineend
+            S_branch += get_injected_power_pu(term)
+        end
+    end
+    if abs(S_sum)>1e-3
+        @warn "Terminal power of TopologicalNode '$(getname(t))' ($(t.id)) does not sum to zero: ΣS = $S_sum. This may indicate an inconsistency in the powerflow results."
+    end
+
+    # nobackref = is_class(vcat(STOP_BACKREF, "ConnectivityNode", "ReactiveCapabilityCurve"))
+    # nobackref = is_class(vcat(STOP_BACKREF, "ReactiveCapabilityCurve"))
+    nobackref = is_class(vcat(STOP_BACKREF, "ReactiveCapabilityCurve"))
+    # noforward = is_class(vcat(STOP_FORWARD, "ConnectivityNode"))
+    filter_out = n -> (is_terminal(n) && is_lineend_terminal(n)) ||
+                      is_busbar_section_terminal(n) ||
+                      is_class(n, [r"Diagram", "VoltageLevel", "Substation", "ConnectivityNode"])
+    sg = discover_subgraph(t; nobackref, #=noforward,=# filter_out, warn)
+    sg.metadata[:busname] = getname(t)
+    sg
+end
+function _discover_linened_subgraph(t; warn)
+    @assert is_lineend_terminal(t) "Expected LineEnd, got $(t.class_name)"
+
+    nobackref = is_class(vcat(STOP_BACKREF, "TopologicalNode", "OperationalLimitSet"))
+    filter_out = is_class([r"Diagram", "Substation", "TopologicalIsland", "ConnectivityNode"])
+    sg = discover_subgraph(t; nobackref, filter_out, warn)
+    sg
+end
+
+export discover_injector
+function discover_injector(t)
+    @assert is_injector_terminal(t) "Expected Injector Terminal, got $(t.class_name)"
+
+    nobackref = is_class(vcat(STOP_BACKREF, "TopologicalNode", "OperationalLimitSet"))
+    filter_out = is_class(["BaseVoltage", "TopologicalIsland"])
+    sg = discover_subgraph(t; nobackref, filter_out, warn=false)
+    sg
+end
+
+
+"""
+    reduce_complexity(collection, filter_classes=String[]; del_uncon=true)
+
+Drop the classes that carry no electrical meaning — diagram layout, geographical position,
+operational limits, base voltages — and then anything left unconnected. Mostly useful to
+get a picture small enough to actually look at.
+
+Pass extra class names in `filter_classes` to remove more.
+"""
+function reduce_complexity(collection, filter_classes=String[]; del_uncon=true)
+    new_collection = filter(
+        !is_class([
+            "OperationalLimitType",
+            "OperationalLimitSet",
+            "VoltageLimit",
+            "CurrentLimit",
+            r"Diagram",
+            "CoordinateSystem",
+            r"Geographical",
+            "Substation",
+            "BaseVoltage",
+            "PositionPoint",
+            "Location",
+            "TopologicalIsland",
+            "CurveData",
+            filter_classes...
+        ]),
+        collection; warn=false
+    )
+    if del_uncon
+        delete_unconnected(new_collection; warn=false)
+    else
+        new_collection
+    end
+end
+
+"""
+    delete_unconnected(collection, keep=collection("TopologicalNode"); warn=true)
+
+Remove objects that are no longer reachable from `keep`, following references in either
+direction. Filtering a collection tends to leave such orphans behind.
+"""
+function delete_unconnected(collection::CIMCollection, keep=collection("TopologicalNode"); warn=true)
+    nodes, g = to_digraph(collection)
+    components = connected_components(g)
+
+    new_nodes = CIMObject[]
+    for c in components
+        component_nodes = nodes[c]
+        if any(n -> n in keep, component_nodes)
+            append!(new_nodes, component_nodes)
+        end
+    end
+
+    new_objects = OrderedDict{String, CIMObject}()
+    for n in new_nodes
+        new_objects[n.id] = copy(n)
+    end
+    new_extensions = Vector{CIMExtension}()
+    for obj in new_nodes
+        for ext_backref in obj.extension
+            @assert ext_backref.source isa CIMExtension
+            push!(new_extensions, copy(ext_backref.source))
+        end
+    end
+    new_collection = CIMCollection(new_objects, new_extensions)
+    resolve_references!(new_collection; warn)
+end
+
+"""
+    to_digraph(collection) -> (nodes, graph)
+
+The collection as a plain `SimpleDiGraph`, one vertex per object and one edge per resolved
+reference. `nodes` gives the object belonging to each vertex index.
+"""
+function to_digraph(collection::CIMCollection)
+    nodes = collect(values(objects(collection)))
+    g = SimpleDiGraph(length(nodes))
+    for (source_idx, node) in enumerate(nodes)
+        for (k, v) in properties(node)
+            if v isa Union{CIMRef,Vector{CIMRef}}
+                for ref in v
+                    ref.resolved || continue
+                    target = follow_ref(ref)
+                    isnothing(target) && continue
+                    target_idx = findfirst(n -> n.id == target.id, nodes)
+                    !isnothing(target_idx) && add_edge!(g, source_idx, target_idx)
+                end
+            end
+        end
+    end
+    nodes, g
+end
