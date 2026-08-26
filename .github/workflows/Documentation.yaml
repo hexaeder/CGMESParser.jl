@@ -1,46 +1,18 @@
-name: CI
+name: Documentation
+
 on:
   push:
     branches:
       - main
-    tags: ['*']
+    tags: '*'
   pull_request:
   workflow_dispatch:
 concurrency:
   # Skip intermediate builds: always.
-  # Cancel intermediate builds: only if it is a pull request build.
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+  cancel-in-progress: true # allways cancle old runs on new push
 jobs:
-  test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    permissions: # needed to allow julia-actions/cache to proactively delete old caches that it has created
-      actions: write
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        version:
-          - '1'
-          - 'lts'
-          - 'pre'
-        os:
-          - ubuntu-latest
-        arch:
-          - x64
-    steps:
-      - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v2
-        with:
-          version: ${{ matrix.version }}
-          arch: ${{ matrix.arch }}
-      - uses: julia-actions/cache@v3
-      - uses: julia-actions/julia-buildpkg@v1
-      - uses: julia-actions/julia-runtest@v1
-  docs:
-    name: Documentation
+  build:
     runs-on: ubuntu-latest
     permissions:
       actions: write # needed to allow julia-actions/cache to proactively delete old caches that it has created
@@ -50,18 +22,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
         with:
-          version: '1'
+          version: 1
       - uses: julia-actions/cache@v3
       - name: Configure doc environment
         shell: julia --project=docs --color=yes {0}
         run: |
           using Pkg
+          Pkg.develop(PackageSpec(path=pwd()))
           Pkg.instantiate()
       - uses: julia-actions/julia-buildpkg@v1
-      - uses: julia-actions/julia-docdeploy@v1
+      - name: Build docs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+        shell: julia --project=docs --color=yes {0}
+        run: |
+          using CGMESParser
+          include(pkgdir(CGMESParser)*"/docs/make.jl")
       - name: Run doctests
         shell: julia --project=docs --color=yes {0}
         run: |
