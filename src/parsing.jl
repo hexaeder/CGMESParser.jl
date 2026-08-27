@@ -14,17 +14,15 @@ KNOWN_PROFILES = [
     :Dynamics,
 ]
 
+# children(), restricted to Element nodes (drops declarations, comments, and the
+# whitespace Text nodes XML.jl keeps between elements in pretty-printed documents)
+element_children(node) = filter(n -> nodetype(n) == XML.Element, children(node))
+
 """
 Extract the "Rescource Description Framework" (RDF) node from the XML document.
 """
 function rdf_node(headnode)
-    childs = children(headnode)
-    # filter out declaration
-    filter!(n -> !(nodetype(n) == XML.Declaration), childs)
-    # filter out comments
-    filter!(n -> !(nodetype(n) == XML.Comment), childs)
-    # only one rdf node should remain
-    only(childs)
+    only(element_children(headnode))
 end
 
 plain_name(el::Node, prefix::String; kw...) = plain_name(el, [prefix]; kw...)
@@ -76,7 +74,7 @@ function parse_metadata(md_node::Node)
     scenario_time = ""
     modeling_authority = ""
 
-    for child in children(md_node)
+    for child in element_children(md_node)
         tag_name = tag(child)
         if tag_name == "md:Model.profile"
             if XML.is_simple(child)
@@ -191,7 +189,7 @@ end
 
 function _parseprops(el::Node, name::AbstractString)
     props = OrderedDict{String, Any}()
-    for p in children(el)
+    for p in element_children(el)
         key = plain_name(p, KNOWN_PREFIXES; strip_ns=[name, "IdentifiedObject"])
         if is_simple(p)
             stringvalue = simple_value(p)
@@ -236,7 +234,7 @@ function CIMFile(filepath::String)
     doc = XML.read(filepath, Node)
     rdf = rdf_node(doc)
 
-    childs = copy(children(rdf))
+    childs = element_children(rdf)
     midx = findall(is_metadata, childs)
     if isnothing(midx)
         error("No md:FullModel metadata found in file: $filepath")
